@@ -1,0 +1,162 @@
+
+--- a/build/common.gypi
++++ b/build/common.gypi
+@@ -1299,6 +1299,9 @@
+     # Use system ICU instead of bundled one.
+     'use_system_icu%' : 0,
+ 
++    # Whether or not the target platform is based on the i.MX SoC
++    'imx_platform%': 1,
++
+     # Default to enabled PIE; this is important for ASLR but we may need to be
+     # able to turn it off for various reasons.
+     'linux_disable_pie%': 0,
+--- a/gpu/config/software_rendering_list_json.cc
++++ b/gpu/config/software_rendering_list_json.cc
+@@ -471,7 +471,8 @@ const char kSoftwareRenderingListJson[] = LONG_STRING_CONST(
+         "all"
+       ]
+     },
+-    {
++    // 48 disabled for i.MX6 integration
++/*    {
+       "id": 48,
+       "description": "Accelerated video decode is unavailable on Linux",
+       "cr_bugs": [137247],
+@@ -481,7 +482,7 @@ const char kSoftwareRenderingListJson[] = LONG_STRING_CONST(
+       "features": [
+         "accelerated_video_decode"
+       ]
+-    },
++    },*/
+     {
+       "id": 49,
+       "description": "NVidia GeForce GT 650M can cause the system to hang with flash 3D",
+--- a/media/gpu/gpu_video_decode_accelerator_factory_impl.cc
++++ b/media/gpu/gpu_video_decode_accelerator_factory_impl.cc
+@@ -9,6 +9,9 @@
+ #include "media/gpu/gpu_video_accelerator_util.h"
+ #include "media/gpu/media_gpu_export.h"
+ 
++#if defined(IMX_PLATFORM)
++#include "media/gpu/imxvpu_video_decode_accelerator.h"
++#endif
+ #if defined(OS_WIN)
+ #include "base/win/windows_version.h"
+ #include "media/gpu/dxva_video_decode_accelerator_win.h"
+@@ -100,6 +103,9 @@ GpuVideoDecodeAcceleratorFactoryImpl::GetDecoderCapabilities(
+ #elif defined(OS_ANDROID)
+   capabilities =
+       AndroidVideoDecodeAccelerator::GetCapabilities(gpu_preferences);
++#elif defined(IMX_PLATFORM)
++  capabilities.supported_profiles =
++      ImxVpuVideoDecodeAccelerator::GetSupportedProfiles();
+ #endif
+   return media::GpuVideoAcceleratorUtil::ConvertMediaToGpuDecodeCapabilities(
+       capabilities);
+@@ -123,6 +129,9 @@ GpuVideoDecodeAcceleratorFactoryImpl::CreateVDA(
+       GpuVideoDecodeAcceleratorFactoryImpl::*)(const gpu::GpuPreferences&)
+       const;
+   const CreateVDAFp create_vda_fps[] = {
++#if defined(IMX_PLATFORM)
++    &GpuVideoDecodeAcceleratorFactoryImpl::CreateImxVpuVDA,
++#endif
+ #if defined(OS_WIN)
+     &GpuVideoDecodeAcceleratorFactoryImpl::CreateDXVAVDA,
+ #endif
+@@ -166,6 +175,19 @@ GpuVideoDecodeAcceleratorFactoryImpl::CreateDXVAVDA(
+ }
+ #endif
+ 
++#if defined(IMX_PLATFORM)
++std::unique_ptr<media::VideoDecodeAccelerator>
++GpuVideoDecodeAcceleratorFactoryImpl::CreateImxVpuVDA(
++    const gpu::GpuPreferences& gpu_preferences) const {
++  std::unique_ptr<media::VideoDecodeAccelerator> decoder;
++
++  DVLOG(0) << "Using the i.MX6 VPU decode accelerator";
++  decoder.reset(new ImxVpuVideoDecodeAccelerator(get_gles2_decoder_cb_.Run(),
++      make_context_current_cb_));
++  return decoder;
++}
++#endif
++
+ #if defined(OS_CHROMEOS) && defined(USE_V4L2_CODEC)
+ std::unique_ptr<media::VideoDecodeAccelerator>
+ GpuVideoDecodeAcceleratorFactoryImpl::CreateV4L2VDA(
+--- a/media/gpu/gpu_video_decode_accelerator_factory_impl.h
++++ b/media/gpu/gpu_video_decode_accelerator_factory_impl.h
+@@ -89,6 +89,10 @@ class MEDIA_GPU_EXPORT GpuVideoDecodeAcceleratorFactoryImpl {
+       const BindGLImageCallback& bind_image_cb,
+       const GetGLES2DecoderCallback& get_gles2_decoder_cb);
+ 
++#if defined(IMX_PLATFORM)
++  std::unique_ptr<media::VideoDecodeAccelerator> CreateImxVpuVDA(
++      const gpu::GpuPreferences& gpu_preferences) const;
++#endif
+ #if defined(OS_WIN)
+   std::unique_ptr<media::VideoDecodeAccelerator> CreateDXVAVDA(
+       const gpu::GpuPreferences& gpu_preferences) const;
+--- a/media/media_gpu.gypi
++++ b/media/media_gpu.gypi
+@@ -116,6 +116,40 @@
+         'gpu/avda_surface_tracker.cc',
+       ],
+     }],
++    ['target_arch == "arm" and imx_platform == 1', {
++      'dependencies': [
++        '../ui/gl/gl.gyp:gl',
++      ],
++      'variables': {
++        'conditions': [
++          ['sysroot!=""', {
++            'pkg-config': '../build/linux/pkg-config-wrapper "<(sysroot)" "<(target_arch)"',
++          }, {
++            'pkg-config': 'pkg-config'
++          }],
++        ],
++      },
++      'sources': [
++        'gpu/imx_gl_viv_direct_texture.cc',
++        'gpu/imx_gl_viv_direct_texture.h',
++        'gpu/imxvpucodec_fslwrapper.c',
++        'gpu/imxvpucodec.h',
++        'gpu/imxvpucodec_platform_chromium.cc',
++        'gpu/imxvpucodec_platform_chromium.h',
++        'gpu/imxvpucodec_platform.h',
++        'gpu/imxvpu_video_decode_accelerator.cc',
++        'gpu/imxvpu_video_decode_accelerator.h',
++      ],
++      'defines': ['IMX_PLATFORM'],
++      'cflags': [
++        '<!@(<(pkg-config) --cflags libfslvpuwrap)',
++      ],
++      'link_settings': {
++        'libraries': [
++          '<!@(<(pkg-config) --libs libfslvpuwrap)',
++        ],
++      },
++    }],
+     ['OS=="android" and enable_webrtc==1', {
+       'dependencies': [
+         '../third_party/libyuv/libyuv.gyp:libyuv',
+--- a/ui/gl/gl_implementation.h
++++ b/ui/gl/gl_implementation.h
+@@ -98,7 +98,7 @@ GL_EXPORT bool HasDesktopGLFeatures();
+ GLImplementation GetNamedGLImplementation(const std::string& name);
+ 
+ // Get the name of a GL implementation.
+-const char* GetGLImplementationName(GLImplementation implementation);
++GL_EXPORT const char* GetGLImplementationName(GLImplementation implementation);
+ 
+ // Add a native library to those searched for GL entry points.
+ void AddGLNativeLibrary(base::NativeLibrary library);
+@@ -117,7 +117,7 @@ GL_EXPORT void SetGLGetProcAddressProc(GLGetProcAddressProc proc);
+ // and when querying functions from the EGL library supplied by Android, it may
+ // return a function that prints a log message about the function being
+ // unsupported.
+-void* GetGLProcAddress(const char* name);
++GL_EXPORT void* GetGLProcAddress(const char* name);
+ 
+ // Return information about the GL window system binding implementation (e.g.,
+ // EGL, GLX, WGL). Returns true if the information was retrieved successfully.
